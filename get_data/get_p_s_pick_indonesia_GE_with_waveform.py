@@ -8,6 +8,7 @@ from obspy import UTCDateTime, Stream
 from obspy.clients.fdsn import Client
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+from obspy import read
 
 # ==================== KONFIGURASI ====================
 
@@ -20,7 +21,7 @@ minlon, maxlon = 95.0, 141.0
 min_magnitude = 2.0
 
 # Rentang tahun
-start_year = 2007
+start_year = 2005
 end_year = 2025
 
 # Parameter waktu
@@ -36,7 +37,7 @@ MIN_FIXED_LENGTH = 3000  # Panjang minimum dalam sampel (30 detik pada 100 Hz)
 MAX_FIXED_LENGTH = 60000  # Panjang maksimum dalam sampel (10 menit pada 100 Hz)
 
 # Direktori penyimpanan
-base_dir = "./dataset_phasenet"
+base_dir = "./dataset_phasenet_from_2005"
 metadata_dir = os.path.join(base_dir, "metadata")
 waveform_dir = os.path.join(base_dir, "waveform")
 npz_dir = os.path.join(base_dir, "npz")
@@ -360,126 +361,179 @@ def fetch_and_process_metadata():
 def download_waveform(row, idx, fixed_length_seconds):
     """Download waveform data for a specific P-S pick pair with fixed length consideration"""
     try:
-        # Ekstrak informasi yang diperlukan
+        # Extract required information
         network = row['p_pick_network']
         station = row['p_pick_station']
+        channel_base = row['p_pick_channel'][:-1] if not pd.isna(row.get('p_pick_channel')) else 'BH'
         p_time = UTCDateTime(row['p_pick_time'])
         s_time = UTCDateTime(row['s_pick_time'])
-
-        # Hitung interval P-S dalam detik
-        p_s_interval = s_time - p_time
-
-        # Format nama file
+        
+        # Format filename
         event_id = row.get('event_id', f"EV_{p_time.strftime('%Y%m%d_%H%M%S')}")
         filename = f"{network}.{station}.{event_id}.mseed"
         full_path = os.path.join(waveform_dir, filename)
-
-        # Skip jika file sudah ada
+        
+        # Skip if file already exists
         if os.path.exists(full_path):
             return idx, filename, True, "File already exists"
-
-        # Kalkulasi berapa banyak waktu kita miliki untuk pre-P dan post-S
-        available_margin = fixed_length_seconds - p_s_interval
-
-        if available_margin <= 0:
-            # Jika interval P-S lebih besar dari panjang tetap, fokuskan pada P dan sebanyak mungkin setelahnya
-            starttime = p_time
-            endtime = p_time + fixed_length_seconds
-            log_message(f"Warning: P-S interval ({p_s_interval:.2f}s) exceeds fixed length ({fixed_length_seconds:.2f}s) for {filename}. S phase may be cut off.")
-        else:
-            # Bagi margin yang tersedia antara pre-P dan post-S secara proporsional
-            # Standarnya: 30% sebelum P, 70% setelah S
-            pre_p_margin = min(PRE_P_TIME, available_margin * 0.3)
-            post_s_margin = min(POST_S_TIME, available_margin * 0.7)
-
-            # Jika masih ada margin tersisa, alokasikan ke yang lain
-            remaining_margin = available_margin - pre_p_margin - post_s_margin
-            if remaining_margin > 0:
-                if pre_p_margin < PRE_P_TIME:
-                    additional_pre_p = min(PRE_P_TIME - pre_p_margin, remaining_margin)
-                    pre_p_margin += additional_pre_p
-                    remaining_margin -= additional_pre_p
-
-                if remaining_margin > 0 and post_s_margin < POST_S_TIME:
-                    post_s_margin += min(POST_S_TIME - post_s_margin, remaining_margin)
-
-            # Tetapkan waktu awal dan akhir
-            starttime = p_time - pre_p_margin
-            endtime = s_time + post_s_margin
-
-        # Pastikan panjang data tidak melebihi fixed_length_seconds
-        if (endtime - starttime) > fixed_length_seconds:
-            endtime = starttime + fixed_length_seconds
-
-        # Request waveform data
-        try:
-            stream = client.get_waveforms(network, station, "*", "*[ENZ]", starttime, endtime)
-        except Exception as e:
-            # Jika ENZ tidak berhasil, coba alternatif 12Z
+        
+        # Calculate time window - simpler approach
+        p_s_interval = s_time - p_time
+        margin = min(PRE_P_TIME, fixed_length_seconds * 0.3)  # Use at most 30% of fixed length for pre-P time
+        
+        starttime = p_time - margin
+        endtime = starttime + fixed_length_seconds
+        
+        # Log the request details for debugging
+        log_message(f"Requesting waveform for {filename}: {network}.{station} from {starttime} to {endtime}")
+        
+        # Initialize empty stream
+        stream = Stream()
+        
+        # Try to get each component separately - more reliable than wildcards
+        components = ['Z', 'N', 'E']  # Typical component order
+        success = False
+        
+        # First attempt: Try with the channel base from metadata
+        for comp in components:
             try:
-                stream = client.get_waveforms(network, station, "*", "*[12Z]", starttime, endtime)
-            except Exception as e2:
-                return idx, None, False, f"Error getting waveforms: {str(e)}, {str(e2)}"
-
-        # Periksa apakah kita punya semua komponen yang diperlukan
-        components = [tr.stats.channel[-1] for tr in stream]
-
-        if not all(c in components for c in ["E", "N", "Z"]) and not all(c in components for c in ["1", "2", "Z"]):
-            return idx, None, False, f"Missing components, found only: {components}"
-
-        # Simpan ke file
+                channel = f"{channel_base}{comp}"
+                st_comp = client.get_waveforms(network, station, "*", channel, starttime, endtime)
+                if st_comp:
+                    stream += st_comp
+                    success = True
+            except Exception as e:
+                log_message(f"  Failed to get {channel}: {str(e)}")
+        
+        # Second attempt: Try with common channel types if first attempt failed
+        if not success:
+            for base in ['BH', 'HH', 'EH', 'SH']:  # Common instrument types
+                if success:
+                    break
+                    
+                try:
+                    for comp in components:
+                        channel = f"{base}{comp}"
+                        st_comp = client.get_waveforms(network, station, "*", channel, starttime, endtime)
+                        if st_comp:
+                            stream += st_comp
+                            success = True
+                except Exception as e:
+                    log_message(f"  Failed to get {base} channels: {str(e)}")
+        
+        # Alternative attempt: Try with 12Z components (for some stations)
+        if not success:
+            try:
+                for comp in ['1', '2', 'Z']:
+                    channel = f"{channel_base[:-1]}{comp}"
+                    st_comp = client.get_waveforms(network, station, "*", channel, starttime, endtime)
+                    if st_comp:
+                        stream += st_comp
+                        success = True
+            except Exception as e:
+                log_message(f"  Failed to get 12Z components: {str(e)}")
+        
+        # Check if we have enough components
+        if not success or len(stream) < 3:
+            return idx, None, False, f"Could not get 3 components for {station}"
+            
+        # Merge traces by ID (in case we got multiple traces per component)
+        stream.merge()
+        
+        # Resample all traces to target sampling rate if needed
+        for tr in stream:
+            if abs(tr.stats.sampling_rate - TARGET_SAMPLING_RATE) > 0.1:
+                tr.interpolate(TARGET_SAMPLING_RATE)
+        
+        # Save to file
         stream.write(full_path, format="MSEED")
-
-        # Catat timing info untuk preprocessing
+        
+        # Calculate timing info for preprocessing
         timing_info = {
             'starttime': starttime.timestamp,
             'endtime': endtime.timestamp,
             'p_time': p_time.timestamp,
             's_time': s_time.timestamp
         }
-
+        
+        log_message(f"Successfully downloaded waveform for {filename}")
         return idx, filename, True, timing_info
-
+        
     except Exception as e:
+        log_message(f"Error downloading waveform: {str(e)}")
         return idx, None, False, f"Error: {str(e)}"
 
 def download_all_waveforms(df, fixed_length_samples):
-    """Download all waveforms for filtered data sequentially"""
+    """Download all waveforms for filtered data sequentially with better error handling"""
     fixed_length_seconds = fixed_length_samples / TARGET_SAMPLING_RATE
     log_message(f"Downloading waveforms for {len(df)} P-S pick pairs with fixed length of {fixed_length_seconds:.2f} seconds...")
 
-    # Download secara sekuensial
-    success_count = 0
-    failure_count = 0
-
-    # Tambah kolom untuk menyimpan timing info
+    # Add columns for tracking results
+    df['waveform_file'] = None
+    df['download_error'] = None
     df['timing_info'] = None
 
-    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Downloading waveforms"):
-        idx_num, filename, success, result = download_waveform(row, idx, fixed_length_seconds)
+    success_count = 0
+    failure_count = 0
+    retry_count = 0
+    max_retries = 3  # For the entire batch
+    
+    # Create a list to track items that need retry
+    retry_list = list(range(len(df)))
+    
+    while retry_list and retry_count < max_retries:
+        if retry_count > 0:
+            log_message(f"Retry attempt {retry_count}/{max_retries} for {len(retry_list)} remaining items")
+        
+        # Create a new list for next retry cycle
+        next_retry = []
+        
+        for idx in tqdm(retry_list, desc=f"Download batch {retry_count+1}", unit="file"):
+            row = df.iloc[idx]
+            
+            # Skip if already downloaded
+            if not pd.isna(df.at[idx, 'waveform_file']):
+                continue
+                
+            idx_num, filename, success, result = download_waveform(row, idx, fixed_length_seconds)
 
-        if success and filename:
-            df.at[idx, 'waveform_file'] = filename
+            if success and filename:
+                df.at[idx, 'waveform_file'] = filename
 
-            # Jika result adalah timing info, simpan untuk preprocessing
-            if isinstance(result, dict):
-                df.at[idx, 'timing_info'] = str(result)
+                # Save timing info for preprocessing
+                if isinstance(result, dict):
+                    df.at[idx, 'timing_info'] = str(result)
 
-            success_count += 1
-
-            # Log progress setiap 10 unduhan berhasil
-            if success_count % 10 == 0:
-                log_message(f"Download progress: {success_count} successful downloads so far")
-        else:
-            df.at[idx, 'download_error'] = result
-            failure_count += 1
-
-        # Tambahkan delay untuk menghindari pembatasan server
-        time.sleep(2)  # Delay 2 detik antar request
-
+                success_count += 1
+                
+                # Log progress periodically
+                if success_count % 10 == 0:
+                    log_message(f"Download progress: {success_count} successful, {failure_count} failed")
+            else:
+                df.at[idx, 'download_error'] = result
+                next_retry.append(idx)  # Add to retry list
+            
+            # Brief pause to avoid overwhelming the server
+            time.sleep(1)
+            
+        # Update retry list and increment counter
+        retry_list = next_retry
+        retry_count += 1
+        
+        # Save progress after each batch
+        df.to_csv(os.path.join(metadata_dir, f"p_s_pick_metadata_with_waveforms_batch{retry_count}.csv"), index=False)
+        
+        # If we still have failures, wait longer before retrying
+        if retry_list and retry_count < max_retries:
+            wait_time = 60 * retry_count  # Progressive backoff
+            log_message(f"Waiting {wait_time} seconds before retry...")
+            time.sleep(wait_time)
+    
+    # Final count of failures
+    failure_count = len(df) - success_count
     log_message(f"Waveform download complete: {success_count} successful, {failure_count} failed")
 
-    # Simpan df yang diupdate
+    # Save final results
     df.to_csv(os.path.join(metadata_dir, "p_s_pick_metadata_with_waveforms.csv"), index=False)
 
     return df
@@ -489,176 +543,230 @@ def download_all_waveforms(df, fixed_length_samples):
 def preprocess_waveform(mseed_file, row, fixed_length_samples):
     """
     Preprocess waveform untuk format PhaseNet dengan panjang tetap
-
-    Args:
-        mseed_file: Path ke file MiniSEED
-        row: Row dari dataframe dengan timing info
-        fixed_length_samples: Panjang tetap dalam sampel
-
-    Returns:
-        Dictionary data preprocessed untuk PhaseNet
     """
     try:
+        # Debug info
+        log_message(f"Processing {mseed_file}")
+        
         # Extract timing info jika tersedia
         timing_info = None
         if not pd.isna(row.get('timing_info')):
             import ast
             try:
                 timing_info = ast.literal_eval(row['timing_info'])
-            except:
-                pass
+                log_message(f"Found timing info: P at {timing_info['p_time']}, S at {timing_info['s_time']}")
+            except Exception as e:
+                log_message(f"Failed to parse timing info: {e}")
 
-        # Baca file MiniSEED
-        stream = Stream()
-        stream = stream.read(mseed_file)
+        # Correct way to read MSEED files in ObsPy
+        try:
+            from obspy import read
+            stream = read(mseed_file)
+            log_message(f"Successfully read MSEED file with {len(stream)} traces")
+            # Log trace details
+            for i, tr in enumerate(stream):
+                log_message(f"Trace {i}: {tr.stats.network}.{tr.stats.station}.{tr.stats.channel}, " +
+                          f"length: {len(tr.data)}, sampling_rate: {tr.stats.sampling_rate}")
+        except Exception as e:
+            log_message(f"Failed to read MSEED file: {e}")
+            return None, False, f"Failed to read MSEED file: {e}"
 
         # Pastikan kita punya 3 komponen
         if len(stream) < 3:
-            return None, False, "Less than 3 components"
+            log_message(f"Warning: Less than 3 components found ({len(stream)})")
+            return None, False, f"Less than 3 components: {len(stream)}"
 
         # Resampling ke 100 Hz
         for tr in stream:
             if abs(tr.stats.sampling_rate - TARGET_SAMPLING_RATE) > 0.1:
                 tr.interpolate(TARGET_SAMPLING_RATE)
+                log_message(f"Resampled trace {tr.stats.channel} to {TARGET_SAMPLING_RATE} Hz")
 
         # Dapatkan waktu P dan S
         p_time = UTCDateTime(row['p_pick_time'])
         s_time = UTCDateTime(row['s_pick_time'])
+        log_message(f"P arrival at {p_time}, S arrival at {s_time}")
 
         # Trim data ke rentang yang sama untuk semua komponen
         stream_starttime = max([tr.stats.starttime for tr in stream])
         stream_endtime = min([tr.stats.endtime for tr in stream])
 
         if stream_endtime <= stream_starttime:
+            log_message(f"Invalid time range after trim: {stream_starttime} to {stream_endtime}")
             return None, False, "Invalid time range after trim"
 
         stream = stream.trim(stream_starttime, stream_endtime)
+        log_message(f"Trimmed stream to {stream_starttime} - {stream_endtime}")
 
         # Detrend dan normalisasi
         stream.detrend('demean')
 
-        # Urutkan komponen
-        components = sorted([tr.stats.channel[-1] for tr in stream])
-
-        # Penanganan untuk berbagai format komponen
-        if set(components) == {'1', '2', 'Z'}:
-            stream_sorted = Stream()
-            for comp in ['1', '2', 'Z']:
-                for tr in stream:
-                    if tr.stats.channel[-1] == comp:
-                        stream_sorted.append(tr)
-                        break
-            stream = stream_sorted
-        elif set(components) == {'E', 'N', 'Z'}:
+        # Urutkan komponen berdasarkan nama channel
+        components = [tr.stats.channel[-1] for tr in stream]
+        log_message(f"Available components: {components}")
+        
+        # Store channel information for output
+        channel_info = ""
+        
+        # Coba deteksi format komponen
+        if set(components).intersection({'E', 'N', 'Z'}) == {'E', 'N', 'Z'}:
+            # Format ENZ
             stream_sorted = Stream()
             for comp in ['E', 'N', 'Z']:
                 for tr in stream:
                     if tr.stats.channel[-1] == comp:
                         stream_sorted.append(tr)
+                        channel_info += tr.stats.channel + "_"
                         break
             stream = stream_sorted
+            log_message("Using ENZ component set")
+        elif set(components).intersection({'1', '2', 'Z'}) == {'1', '2', 'Z'}:
+            # Format 12Z
+            stream_sorted = Stream()
+            for comp in ['1', '2', 'Z']:
+                for tr in stream:
+                    if tr.stats.channel[-1] == comp:
+                        stream_sorted.append(tr)
+                        channel_info += tr.stats.channel + "_"
+                        break
+            stream = stream_sorted
+            log_message("Using 12Z component set")
         else:
-            return None, False, f"Cannot sort components: {components}"
+            # Custom sorting jika tidak sesuai format standar
+            from obspy import trace
+            # Sort komponen yang tersedia
+            sorted_comps = sorted(components)
+            if len(sorted_comps) < 3:
+                # Isi dengan dummy jika kurang dari 3
+                while len(sorted_comps) < 3:
+                    sorted_comps.append(f"X{len(sorted_comps)}")
+            
+            stream_sorted = Stream()
+            for i, comp in enumerate(sorted_comps[:3]):  # Ambil 3 komponen pertama
+                comp_found = False
+                for tr in stream:
+                    if tr.stats.channel[-1] == comp:
+                        stream_sorted.append(tr)
+                        channel_info += tr.stats.channel + "_"
+                        comp_found = True
+                        break
+                
+                if not comp_found:
+                    # Buat dummy trace jika komponen tidak ada
+                    log_message(f"Creating dummy trace for component {comp}")
+                    template_tr = stream[0]
+                    dummy_data = np.zeros_like(template_tr.data)
+                    header = template_tr.stats.copy()
+                    header.channel = header.channel[:-1] + comp
+                    dummy_tr = trace.Trace(data=dummy_data, header=header)
+                    stream_sorted.append(dummy_tr)
+                    channel_info += header.channel + "_"
+            
+            stream = stream_sorted
+            log_message(f"Using custom component set: {[tr.stats.channel[-1] for tr in stream]}")
+
+        # Remove trailing underscore from channel_info
+        channel_info = channel_info.rstrip("_")
+        log_message(f"Channel info: {channel_info}")
+
+        # Normalisasi amplitudo untuk setiap trace
+        for tr in stream:
+            if np.any(tr.data):  # Skip jika semua nol
+                tr.data = tr.data / np.max(np.abs(tr.data))
 
         # Hitung indeks P dan S dalam jendela trimmed
         if p_time < stream[0].stats.starttime or p_time > stream[0].stats.endtime:
+            log_message(f"P time outside data range: {p_time} not in [{stream[0].stats.starttime} - {stream[0].stats.endtime}]")
             return None, False, "P time outside data range"
 
         if s_time < stream[0].stats.starttime or s_time > stream[0].stats.endtime:
-            # Jika S di luar rentang, gunakan timing info dari download jika tersedia
-            if timing_info and timing_info['s_time'] > timing_info['p_time']:
-                # Kita tahu S seharusnya ada namun terpotong
-                # Hitung indeks S berdasarkan jarak P-S yang diketahui
+            # Jika S di luar rentang, gunakan timing info
+            if timing_info and 'p_time' in timing_info and 's_time' in timing_info:
                 p_s_interval_samples = int((timing_info['s_time'] - timing_info['p_time']) * TARGET_SAMPLING_RATE)
                 p_sample = int((p_time - stream[0].stats.starttime) * TARGET_SAMPLING_RATE)
                 s_sample = p_sample + p_s_interval_samples
-
-                # Jika masih di luar rentang, gunakan indeks terakhir
+                
                 if s_sample >= len(stream[0].data):
                     s_sample = len(stream[0].data) - 1
-                    log_message(f"Warning: S-phase outside data range for {row.get('waveform_file')}. Using estimated S index.")
+                    log_message(f"Estimated S phase at end of trace (sample {s_sample})")
             else:
+                log_message(f"S time outside data range and no timing info available")
                 return None, False, "S time outside data range and no timing info available"
         else:
-            # Hitung indeks P dan S normal
             p_sample = int((p_time - stream[0].stats.starttime) * TARGET_SAMPLING_RATE)
             s_sample = int((s_time - stream[0].stats.starttime) * TARGET_SAMPLING_RATE)
+            log_message(f"P at sample {p_sample}, S at sample {s_sample}")
 
-        # Buat array dengan panjang tetap
-        data = np.zeros((fixed_length_samples, 1, 3))
+        # Buat array dengan panjang tetap - FIXED: Using (n, 3) shape instead of (n, 1, 3)
+        data = np.zeros((fixed_length_samples, 3))
 
-        # Tentukan strategi untuk menyesuaikan data ke panjang tetap
+        # Menyesuaikan data ke panjang tetap
         actual_length = len(stream[0].data)
+        log_message(f"Actual data length: {actual_length}, fixed length: {fixed_length_samples}")
 
         if actual_length <= fixed_length_samples:
             # Jika data aktual lebih pendek, copy semua dan biarkan sisanya nol
-            for i, tr in enumerate(stream):
-                data[:len(tr.data), 0, i] = tr.data
+            for i, tr in enumerate(stream[:3]):  # Pastikan hanya 3 komponen
+                data[:len(tr.data), i] = tr.data
+            log_message("Data padded with zeros")
         else:
-            # Jika data lebih panjang, kita perlu memotongnya
-            # Strategi: Pastikan P dan S tetap dalam rentang data
-            # Jika jarak P-S lebih kecil dari fixed_length_samples, bisa centang di sekitar keduanya
-            # Jika tidak, prioritaskan P dan potong dari awal
-
+            # Strategi window untuk data yang lebih panjang
             p_s_interval_samples = s_sample - p_sample
-
-            if p_s_interval_samples < fixed_length_samples:
-                # Bisa mengambil kedua fase
-                # Alokasikan margin sebelum P dan setelah S secara proporsional
+            
+            if p_s_interval_samples < fixed_length_samples and p_s_interval_samples > 0:
+                # Bagi jendela di sekitar P dan S
                 available_margin = fixed_length_samples - p_s_interval_samples
                 pre_p_margin = min(p_sample, available_margin // 2)
                 post_s_margin = min(actual_length - s_sample - 1, available_margin - pre_p_margin)
-
-                # Jika masih ada margin tersisa, tambahkan ke pre_p
-                if pre_p_margin + post_s_margin < available_margin:
-                    additional_pre_p = min(p_sample, available_margin - pre_p_margin - post_s_margin)
-                    pre_p_margin += additional_pre_p
-
-                # Tentukan indeks awal dan akhir
+                
                 start_idx = p_sample - pre_p_margin
                 end_idx = s_sample + post_s_margin
-
-                # Pastikan rentang tidak melebihi data
+                
                 if end_idx > actual_length:
                     end_idx = actual_length
                     start_idx = max(0, end_idx - fixed_length_samples)
-
-                # Copy data dan update indeks P dan S
-                for i, tr in enumerate(stream):
-                    data_length = min(fixed_length_samples, len(tr.data) - start_idx)
-                    data[:data_length, 0, i] = tr.data[start_idx:start_idx + data_length]
-
-                # Update indeks P dan S relatif terhadap jendela baru
+                
+                log_message(f"Window from {start_idx} to {end_idx} (length: {end_idx-start_idx})")
+                
+                for i, tr in enumerate(stream[:3]):
+                    window_length = min(fixed_length_samples, len(tr.data) - start_idx)
+                    data[:window_length, i] = tr.data[start_idx:start_idx+window_length]
+                
+                # Update P and S indices
                 p_sample = p_sample - start_idx
                 s_sample = s_sample - start_idx
             else:
-                # Jarak P-S terlalu besar, prioritaskan P dan potong dari awal
-                for i, tr in enumerate(stream):
-                    data[:fixed_length_samples, 0, i] = tr.data[:fixed_length_samples]
-
-                # S mungkin terpotong, periksa
+                # Jika P-S interval tidak valid atau terlalu besar, ambil dari awal
+                for i, tr in enumerate(stream[:3]):
+                    data[:fixed_length_samples, i] = tr.data[:fixed_length_samples]
+                
                 if s_sample >= fixed_length_samples:
-                    log_message(f"Warning: S-phase at sample {s_sample} beyond fixed length {fixed_length_samples} for {row.get('waveform_file')}. Using estimated S index.")
-                    s_sample = fixed_length_samples - 1  # Gunakan indeks terakhir sebagai estimasi
-
-        # Pastikan indeks dalam rentang yang valid
+                    s_sample = fixed_length_samples - 1
+        
+        # Pastikan indeks dalam batas valid dan P sebelum S
         p_sample = max(0, min(p_sample, fixed_length_samples - 1))
-        s_sample = max(0, min(s_sample, fixed_length_samples - 1))
+        s_sample = max(p_sample + 1, min(s_sample, fixed_length_samples - 1))
+        log_message(f"Final indices - P: {p_sample}, S: {s_sample}")
 
-        # Pastikan P selalu sebelum S
-        if p_sample >= s_sample:
-            s_sample = min(p_sample + 1, fixed_length_samples - 1)
-
-        return {
+        # Buat hasil untuk PhaseNet with corrected format
+        result = {
             'data': data,
             'p_idx': [[p_sample]],
             's_idx': [[s_sample]],
             'station_id': stream[0].stats.station,
-            't0': stream[0].stats.starttime.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
-        }, True, "Success"
+            't0': stream[0].stats.starttime.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+            'channel': channel_info  # Added channel information
+        }
+        
+        log_message(f"Successfully preprocessed waveform")
+        return result, True, "Success"
 
     except Exception as e:
+        import traceback
+        log_message(f"Exception in preprocess_waveform: {str(e)}")
+        log_message(traceback.format_exc())
         return None, False, f"Error preprocessing: {str(e)}"
+
 
 def preprocess_all_waveforms(df, fixed_length_samples):
     """Preprocess all downloaded waveforms dengan panjang tetap"""
@@ -666,6 +774,12 @@ def preprocess_all_waveforms(df, fixed_length_samples):
 
     success_count = 0
     failure_count = 0
+    
+    # Add detailed log file for preprocessing errors
+    preprocess_error_log = os.path.join(metadata_dir, "preprocess_errors.txt")
+    with open(preprocess_error_log, 'w') as f:
+        f.write("Preprocessing Error Log\n")
+        f.write("======================\n\n")
 
     for idx, row in tqdm(df.iterrows(), total=len(df), desc="Preprocessing waveforms"):
         if pd.isna(row.get('waveform_file', None)):
@@ -673,6 +787,7 @@ def preprocess_all_waveforms(df, fixed_length_samples):
 
         try:
             mseed_file = os.path.join(waveform_dir, row['waveform_file'])
+            log_message(f"Processing {mseed_file}")
 
             # Preprocess waveform
             result, success, message = preprocess_waveform(mseed_file, row, fixed_length_samples)
@@ -689,15 +804,32 @@ def preprocess_all_waveforms(df, fixed_length_samples):
                 # Plot contoh untuk validasi visual (batasi jumlah plot)
                 if success_count <= 20:  # Hanya plot 20 contoh pertama
                     plot_waveform_with_picks(result, os.path.join(figure_dir, f"{npz_filename.replace('.npz', '')}.png"))
+                    
+                log_message(f"Successfully created NPZ file: {npz_filename}")
             else:
                 df.at[idx, 'preprocess_error'] = message
                 failure_count += 1
+                
+                # Log detailed error
+                with open(preprocess_error_log, 'a') as f:
+                    f.write(f"File: {mseed_file}\n")
+                    f.write(f"Error: {message}\n")
+                    f.write("---\n\n")
 
         except Exception as e:
             df.at[idx, 'preprocess_error'] = str(e)
             failure_count += 1
+            
+            # Log exception
+            with open(preprocess_error_log, 'a') as f:
+                f.write(f"File: {mseed_file}\n")
+                f.write(f"Exception: {str(e)}\n")
+                import traceback
+                f.write(traceback.format_exc())
+                f.write("---\n\n")
 
     log_message(f"Preprocessing complete: {success_count} successful, {failure_count} failed")
+    log_message(f"Detailed error log saved to {preprocess_error_log}")
 
     # Simpan df yang diupdate
     df.to_csv(os.path.join(metadata_dir, "p_s_pick_metadata_preprocessed.csv"), index=False)
