@@ -9,6 +9,7 @@ from obspy.clients.fdsn import Client
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from obspy import read
+from sklearn.model_selection import train_test_split
 
 # ==================== KONFIGURASI ====================
 
@@ -37,14 +38,15 @@ MIN_FIXED_LENGTH = 3000  # Panjang minimum dalam sampel (30 detik pada 100 Hz)
 MAX_FIXED_LENGTH = 60000  # Panjang maksimum dalam sampel (10 menit pada 100 Hz)
 
 # Direktori penyimpanan
-base_dir = "./dataset_phasenet_from_2005"
+base_dir = "./dataset_phasenet_sample_4 "
 metadata_dir = os.path.join(base_dir, "metadata")
 waveform_dir = os.path.join(base_dir, "waveform")
 npz_dir = os.path.join(base_dir, "npz")
+npz_padded_dir = os.path.join(base_dir, "npz_padded")  # Direktori baru untuk NPZ yang sudah di-padding
 figure_dir = os.path.join(base_dir, "figures")
 
 # Buat direktori
-for d in [metadata_dir, waveform_dir, npz_dir, figure_dir]:
+for d in [metadata_dir, waveform_dir, npz_dir, npz_padded_dir, figure_dir]:
     os.makedirs(d, exist_ok=True)
 
 # File paths
@@ -53,6 +55,7 @@ merged_csv = os.path.join(metadata_dir, "p_s_pick_metadata_merged.csv")
 filtered_csv = os.path.join(metadata_dir, "p_s_pick_metadata_filtered.csv")
 config_file = os.path.join(base_dir, "dataset_config.json")
 data_list_csv = os.path.join(base_dir, "data_list.csv")
+padded_data_list_csv = os.path.join(base_dir, "padded_data_list.csv")  # File data list untuk NPZ yang sudah di-padding
 
 # Daftar kategori arrival P-wave dan S-wave
 p_phases = {"p", "pp", "pg", "pn", "pb", "pdiff", "pkp", "pkikp"}
@@ -367,33 +370,33 @@ def download_waveform(row, idx, fixed_length_seconds):
         channel_base = row['p_pick_channel'][:-1] if not pd.isna(row.get('p_pick_channel')) else 'BH'
         p_time = UTCDateTime(row['p_pick_time'])
         s_time = UTCDateTime(row['s_pick_time'])
-        
+
         # Format filename
         event_id = row.get('event_id', f"EV_{p_time.strftime('%Y%m%d_%H%M%S')}")
         filename = f"{network}.{station}.{event_id}.mseed"
         full_path = os.path.join(waveform_dir, filename)
-        
+
         # Skip if file already exists
         if os.path.exists(full_path):
             return idx, filename, True, "File already exists"
-        
+
         # Calculate time window - simpler approach
         p_s_interval = s_time - p_time
         margin = min(PRE_P_TIME, fixed_length_seconds * 0.3)  # Use at most 30% of fixed length for pre-P time
-        
+
         starttime = p_time - margin
         endtime = starttime + fixed_length_seconds
-        
+
         # Log the request details for debugging
         log_message(f"Requesting waveform for {filename}: {network}.{station} from {starttime} to {endtime}")
-        
+
         # Initialize empty stream
         stream = Stream()
-        
+
         # Try to get each component separately - more reliable than wildcards
         components = ['Z', 'N', 'E']  # Typical component order
         success = False
-        
+
         # First attempt: Try with the channel base from metadata
         for comp in components:
             try:
@@ -404,13 +407,13 @@ def download_waveform(row, idx, fixed_length_seconds):
                     success = True
             except Exception as e:
                 log_message(f"  Failed to get {channel}: {str(e)}")
-        
+
         # Second attempt: Try with common channel types if first attempt failed
         if not success:
             for base in ['BH', 'HH', 'EH', 'SH']:  # Common instrument types
                 if success:
                     break
-                    
+
                 try:
                     for comp in components:
                         channel = f"{base}{comp}"
@@ -420,7 +423,7 @@ def download_waveform(row, idx, fixed_length_seconds):
                             success = True
                 except Exception as e:
                     log_message(f"  Failed to get {base} channels: {str(e)}")
-        
+
         # Alternative attempt: Try with 12Z components (for some stations)
         if not success:
             try:
@@ -432,22 +435,22 @@ def download_waveform(row, idx, fixed_length_seconds):
                         success = True
             except Exception as e:
                 log_message(f"  Failed to get 12Z components: {str(e)}")
-        
+
         # Check if we have enough components
         if not success or len(stream) < 3:
             return idx, None, False, f"Could not get 3 components for {station}"
-            
+
         # Merge traces by ID (in case we got multiple traces per component)
         stream.merge()
-        
+
         # Resample all traces to target sampling rate if needed
         for tr in stream:
             if abs(tr.stats.sampling_rate - TARGET_SAMPLING_RATE) > 0.1:
                 tr.interpolate(TARGET_SAMPLING_RATE)
-        
+
         # Save to file
         stream.write(full_path, format="MSEED")
-        
+
         # Calculate timing info for preprocessing
         timing_info = {
             'starttime': starttime.timestamp,
@@ -455,10 +458,10 @@ def download_waveform(row, idx, fixed_length_seconds):
             'p_time': p_time.timestamp,
             's_time': s_time.timestamp
         }
-        
+
         log_message(f"Successfully downloaded waveform for {filename}")
         return idx, filename, True, timing_info
-        
+
     except Exception as e:
         log_message(f"Error downloading waveform: {str(e)}")
         return idx, None, False, f"Error: {str(e)}"
@@ -477,24 +480,24 @@ def download_all_waveforms(df, fixed_length_samples):
     failure_count = 0
     retry_count = 0
     max_retries = 3  # For the entire batch
-    
+
     # Create a list to track items that need retry
     retry_list = list(range(len(df)))
-    
+
     while retry_list and retry_count < max_retries:
         if retry_count > 0:
             log_message(f"Retry attempt {retry_count}/{max_retries} for {len(retry_list)} remaining items")
-        
+
         # Create a new list for next retry cycle
         next_retry = []
-        
+
         for idx in tqdm(retry_list, desc=f"Download batch {retry_count+1}", unit="file"):
             row = df.iloc[idx]
-            
+
             # Skip if already downloaded
             if not pd.isna(df.at[idx, 'waveform_file']):
                 continue
-                
+
             idx_num, filename, success, result = download_waveform(row, idx, fixed_length_seconds)
 
             if success and filename:
@@ -505,30 +508,30 @@ def download_all_waveforms(df, fixed_length_samples):
                     df.at[idx, 'timing_info'] = str(result)
 
                 success_count += 1
-                
+
                 # Log progress periodically
                 if success_count % 10 == 0:
                     log_message(f"Download progress: {success_count} successful, {failure_count} failed")
             else:
                 df.at[idx, 'download_error'] = result
                 next_retry.append(idx)  # Add to retry list
-            
+
             # Brief pause to avoid overwhelming the server
             time.sleep(1)
-            
+
         # Update retry list and increment counter
         retry_list = next_retry
         retry_count += 1
-        
+
         # Save progress after each batch
         df.to_csv(os.path.join(metadata_dir, f"p_s_pick_metadata_with_waveforms_batch{retry_count}.csv"), index=False)
-        
+
         # If we still have failures, wait longer before retrying
         if retry_list and retry_count < max_retries:
             wait_time = 60 * retry_count  # Progressive backoff
             log_message(f"Waiting {wait_time} seconds before retry...")
             time.sleep(wait_time)
-    
+
     # Final count of failures
     failure_count = len(df) - success_count
     log_message(f"Waveform download complete: {success_count} successful, {failure_count} failed")
@@ -547,7 +550,7 @@ def preprocess_waveform(mseed_file, row, fixed_length_samples):
     try:
         # Debug info
         log_message(f"Processing {mseed_file}")
-        
+
         # Extract timing info jika tersedia
         timing_info = None
         if not pd.isna(row.get('timing_info')):
@@ -566,7 +569,7 @@ def preprocess_waveform(mseed_file, row, fixed_length_samples):
             # Log trace details
             for i, tr in enumerate(stream):
                 log_message(f"Trace {i}: {tr.stats.network}.{tr.stats.station}.{tr.stats.channel}, " +
-                          f"length: {len(tr.data)}, sampling_rate: {tr.stats.sampling_rate}")
+                            f"length: {len(tr.data)}, sampling_rate: {tr.stats.sampling_rate}")
         except Exception as e:
             log_message(f"Failed to read MSEED file: {e}")
             return None, False, f"Failed to read MSEED file: {e}"
@@ -604,10 +607,10 @@ def preprocess_waveform(mseed_file, row, fixed_length_samples):
         # Urutkan komponen berdasarkan nama channel
         components = [tr.stats.channel[-1] for tr in stream]
         log_message(f"Available components: {components}")
-        
+
         # Store channel information for output
         channel_info = ""
-        
+
         # Coba deteksi format komponen
         if set(components).intersection({'E', 'N', 'Z'}) == {'E', 'N', 'Z'}:
             # Format ENZ
@@ -640,7 +643,7 @@ def preprocess_waveform(mseed_file, row, fixed_length_samples):
                 # Isi dengan dummy jika kurang dari 3
                 while len(sorted_comps) < 3:
                     sorted_comps.append(f"X{len(sorted_comps)}")
-            
+
             stream_sorted = Stream()
             for i, comp in enumerate(sorted_comps[:3]):  # Ambil 3 komponen pertama
                 comp_found = False
@@ -650,7 +653,7 @@ def preprocess_waveform(mseed_file, row, fixed_length_samples):
                         channel_info += tr.stats.channel + "_"
                         comp_found = True
                         break
-                
+
                 if not comp_found:
                     # Buat dummy trace jika komponen tidak ada
                     log_message(f"Creating dummy trace for component {comp}")
@@ -661,7 +664,7 @@ def preprocess_waveform(mseed_file, row, fixed_length_samples):
                     dummy_tr = trace.Trace(data=dummy_data, header=header)
                     stream_sorted.append(dummy_tr)
                     channel_info += header.channel + "_"
-            
+
             stream = stream_sorted
             log_message(f"Using custom component set: {[tr.stats.channel[-1] for tr in stream]}")
 
@@ -685,7 +688,7 @@ def preprocess_waveform(mseed_file, row, fixed_length_samples):
                 p_s_interval_samples = int((timing_info['s_time'] - timing_info['p_time']) * TARGET_SAMPLING_RATE)
                 p_sample = int((p_time - stream[0].stats.starttime) * TARGET_SAMPLING_RATE)
                 s_sample = p_sample + p_s_interval_samples
-                
+
                 if s_sample >= len(stream[0].data):
                     s_sample = len(stream[0].data) - 1
                     log_message(f"Estimated S phase at end of trace (sample {s_sample})")
@@ -697,7 +700,7 @@ def preprocess_waveform(mseed_file, row, fixed_length_samples):
             s_sample = int((s_time - stream[0].stats.starttime) * TARGET_SAMPLING_RATE)
             log_message(f"P at sample {p_sample}, S at sample {s_sample}")
 
-        # Buat array dengan panjang tetap - FIXED: Using (n, 3) shape instead of (n, 1, 3)
+        # Buat array dengan panjang tetap
         data = np.zeros((fixed_length_samples, 3))
 
         # Menyesuaikan data ke panjang tetap
@@ -712,26 +715,26 @@ def preprocess_waveform(mseed_file, row, fixed_length_samples):
         else:
             # Strategi window untuk data yang lebih panjang
             p_s_interval_samples = s_sample - p_sample
-            
+
             if p_s_interval_samples < fixed_length_samples and p_s_interval_samples > 0:
                 # Bagi jendela di sekitar P dan S
                 available_margin = fixed_length_samples - p_s_interval_samples
                 pre_p_margin = min(p_sample, available_margin // 2)
                 post_s_margin = min(actual_length - s_sample - 1, available_margin - pre_p_margin)
-                
+
                 start_idx = p_sample - pre_p_margin
                 end_idx = s_sample + post_s_margin
-                
+
                 if end_idx > actual_length:
                     end_idx = actual_length
                     start_idx = max(0, end_idx - fixed_length_samples)
-                
+
                 log_message(f"Window from {start_idx} to {end_idx} (length: {end_idx-start_idx})")
-                
+
                 for i, tr in enumerate(stream[:3]):
                     window_length = min(fixed_length_samples, len(tr.data) - start_idx)
                     data[:window_length, i] = tr.data[start_idx:start_idx+window_length]
-                
+
                 # Update P and S indices
                 p_sample = p_sample - start_idx
                 s_sample = s_sample - start_idx
@@ -739,10 +742,10 @@ def preprocess_waveform(mseed_file, row, fixed_length_samples):
                 # Jika P-S interval tidak valid atau terlalu besar, ambil dari awal
                 for i, tr in enumerate(stream[:3]):
                     data[:fixed_length_samples, i] = tr.data[:fixed_length_samples]
-                
+
                 if s_sample >= fixed_length_samples:
                     s_sample = fixed_length_samples - 1
-        
+
         # Pastikan indeks dalam batas valid dan P sebelum S
         p_sample = max(0, min(p_sample, fixed_length_samples - 1))
         s_sample = max(p_sample + 1, min(s_sample, fixed_length_samples - 1))
@@ -757,7 +760,7 @@ def preprocess_waveform(mseed_file, row, fixed_length_samples):
             't0': stream[0].stats.starttime.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
             'channel': channel_info  # Added channel information
         }
-        
+
         log_message(f"Successfully preprocessed waveform")
         return result, True, "Success"
 
@@ -774,7 +777,7 @@ def preprocess_all_waveforms(df, fixed_length_samples):
 
     success_count = 0
     failure_count = 0
-    
+
     # Add detailed log file for preprocessing errors
     preprocess_error_log = os.path.join(metadata_dir, "preprocess_errors.txt")
     with open(preprocess_error_log, 'w') as f:
@@ -804,12 +807,12 @@ def preprocess_all_waveforms(df, fixed_length_samples):
                 # Plot contoh untuk validasi visual (batasi jumlah plot)
                 if success_count <= 20:  # Hanya plot 20 contoh pertama
                     plot_waveform_with_picks(result, os.path.join(figure_dir, f"{npz_filename.replace('.npz', '')}.png"))
-                    
+
                 log_message(f"Successfully created NPZ file: {npz_filename}")
             else:
                 df.at[idx, 'preprocess_error'] = message
                 failure_count += 1
-                
+
                 # Log detailed error
                 with open(preprocess_error_log, 'a') as f:
                     f.write(f"File: {mseed_file}\n")
@@ -819,7 +822,7 @@ def preprocess_all_waveforms(df, fixed_length_samples):
         except Exception as e:
             df.at[idx, 'preprocess_error'] = str(e)
             failure_count += 1
-            
+
             # Log exception
             with open(preprocess_error_log, 'a') as f:
                 f.write(f"File: {mseed_file}\n")
@@ -853,7 +856,7 @@ def plot_waveform_with_picks(data_dict, output_file):
         component_labels = ["E", "N", "Z"]
         for i in range(3):
             plt.subplot(3, 1, i+1)
-            plt.plot(data[:, 0, i], 'k', linewidth=0.8)
+            plt.plot(data[:, i], 'k', linewidth=0.8)  # Corrected to use proper indexing
 
             # Mark P dan S
             plt.axvline(x=p_idx, color='blue', linestyle='--', label='P pick')
@@ -894,7 +897,8 @@ def create_data_list():
             return False
 
         # Buat DataFrame dengan nama file
-        df = pd.DataFrame({"fname": npz_files})
+        basenames = [os.path.basename(fp) for fp in npz_files]
+        df = pd.DataFrame({"fname": basenames})
 
         # Simpan ke CSV
         df.to_csv(data_list_csv, index=False)
@@ -904,6 +908,148 @@ def create_data_list():
 
     except Exception as e:
         log_message(f"Error creating data list: {str(e)}")
+        return False
+
+# ==================== FUNGSI POST-PROCESSING NPZ FILES ====================
+
+def pad_npz_files():
+    """Melakukan padding pada file NPZ agar indeks P selalu minimal 3001"""
+    log_message("Starting NPZ file padding process...")
+
+    # Definisikan direktori
+    input_dir = npz_dir
+    output_dir = npz_padded_dir
+
+    # Buat direktori output (sudah dibuat di awal konfigurasi)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Dapatkan semua file NPZ
+    files = glob.glob(os.path.join(input_dir, "*.npz"))
+    log_message(f"Total files to process: {len(files)}")
+
+    # Inisialisasi counter statistik
+    total_processed = 0
+    total_padded = 0
+    min_p_overall = float('inf')
+    max_padding_added = 0
+
+    for file_path in tqdm(files, desc="Processing NPZ files"):
+        try:
+            # Load data NPZ
+            npz_data = dict(np.load(file_path))
+
+            # Ambil nama file tanpa path
+            filename = os.path.basename(file_path)
+
+            # Cek apakah p_idx ada dalam file
+            if 'p_idx' not in npz_data:
+                log_message(f"Warning: {filename} does not contain p_idx. Skipping.")
+                continue
+
+            # Dapatkan nilai p_idx minimum
+            p_idx = npz_data['p_idx']
+            min_p = float('inf')
+
+            # Cari nilai p_idx minimum
+            for group in p_idx:
+                for idx in group:
+                    if idx < min_p:
+                        min_p = idx
+
+            # Update min_p keseluruhan untuk statistik
+            if min_p < min_p_overall:
+                min_p_overall = min_p
+
+            # Cek apakah perlu padding
+            if min_p < 3000:
+                # Hitung jumlah padding yang dibutuhkan
+                padding_needed = 3001 - min_p
+                max_padding_added = max(max_padding_added, padding_needed)
+
+                # Buat data dengan padding
+                original_data = npz_data['data']
+
+                # Cek dimensi data untuk padding yang tepat
+                if len(original_data.shape) == 2:  # (time, channel)
+                    padded_data = np.pad(original_data, ((padding_needed, 0), (0, 0)), 'constant')
+                elif len(original_data.shape) == 3:  # (time, 1, channel) or (time, station, channel)
+                    padded_data = np.pad(original_data, ((padding_needed, 0), (0, 0), (0, 0)), 'constant')
+                else:
+                    log_message(f"Warning: Unexpected data shape {original_data.shape} in {filename}")
+                    padded_data = original_data  # Default fallback
+
+                # Update data dengan versi yang sudah di-padding
+                npz_data['data'] = padded_data
+
+                # Update p_idx dan s_idx
+                if 'p_idx' in npz_data:
+                    npz_data['p_idx'] = [[idx + padding_needed for idx in group] for group in npz_data['p_idx']]
+
+                if 's_idx' in npz_data:
+                    npz_data['s_idx'] = [[idx + padding_needed for idx in group] for group in npz_data['s_idx']]
+
+                # Tambah counter
+                total_padded += 1
+
+                log_message(f"Padded {filename}: Added {padding_needed} samples, min_p shifted from {min_p} to {min_p + padding_needed}")
+
+            # Simpan file (yang di-padding maupun tidak)
+            output_path = os.path.join(output_dir, filename)
+            np.savez(output_path, **npz_data)
+
+            total_processed += 1
+
+        except Exception as e:
+            log_message(f"Error processing {file_path}: {str(e)}")
+
+    # Tampilkan statistik akhir
+    log_message("\nPadding process complete!")
+    log_message(f"Total files processed: {total_processed}")
+    log_message(f"Total files padded: {total_padded}")
+    log_message(f"Minimum P index found: {min_p_overall}")
+    log_message(f"Maximum padding added: {max_padding_added}")
+    log_message(f"Output saved to: {output_dir}")
+
+    return total_processed, total_padded
+
+def create_padded_data_lists(split_ratio=0.2):
+    """Buat data list untuk file NPZ yang sudah di-padding"""
+    log_message("Creating data lists for padded NPZ files...")
+
+    try:
+        # Cari semua file NPZ yang sudah di-padding
+        npz_files = glob.glob(os.path.join(npz_padded_dir, "*.npz"))
+
+        if not npz_files:
+            log_message("No padded NPZ files found!")
+            return False
+
+        # Buat data list utama
+        with open(padded_data_list_csv, 'w') as f:
+            for file_path in npz_files:
+                basename = os.path.basename(file_path)  # Ambil hanya nama file
+                f.write(f"{basename}\n") 
+
+        log_message(f"Padded data list created with {len(npz_files)} files at {padded_data_list_csv}")
+
+        # Buat training dan validation list dengan split
+        basenames = [os.path.basename(fp) for fp in npz_files]
+        df = pd.DataFrame({"fname": basenames})
+        train_df, val_df = train_test_split(df, test_size=split_ratio, random_state=42)
+
+        train_list = os.path.join(base_dir, "padded_train_list.csv")
+        val_list = os.path.join(base_dir, "padded_valid_list.csv")
+
+        train_df.to_csv(train_list, index=False)
+        val_df.to_csv(val_list, index=False)
+
+        log_message(f"Training list created with {len(train_df)} files: {train_list}")
+        log_message(f"Validation list created with {len(val_df)} files: {val_list}")
+
+        return True
+
+    except Exception as e:
+        log_message(f"Error creating padded data lists: {str(e)}")
         return False
 
 # ==================== FUNGSI UTAMA ====================
@@ -939,18 +1085,34 @@ def main():
     log_message("\nSTEP 6: CREATING DATA LIST FOR PHASENET")
     create_data_list()
 
+    # Step 7: Post-processing NPZ files untuk padding P index minimal 3001
+    log_message("\nSTEP 7: POST-PROCESSING NPZ FILES (PADDING P INDEX)")
+    total_processed, total_padded = pad_npz_files()
+
+    # Step 8: Buat data list untuk file yang sudah di-padding
+    log_message("\nSTEP 8: CREATING DATA LISTS FOR PADDED FILES")
+    create_padded_data_lists(split_ratio=0.05)
+
     # Statistik akhir
     npz_count = len(glob.glob(os.path.join(npz_dir, "*.npz")))
+    padded_npz_count = len(glob.glob(os.path.join(npz_padded_dir, "*.npz")))
 
     log_message("\nPROCESS COMPLETED")
     log_message("===================")
     log_message(f"Total metadata records: {len(df_filtered)}")
     log_message(f"Total waveforms downloaded: {len(df_preprocessed[~pd.isna(df_preprocessed['waveform_file'])])}")
     log_message(f"Total NPZ files created: {npz_count}")
+    log_message(f"Total NPZ files padded: {total_padded} of {total_processed}")
+    log_message(f"Total padded NPZ files: {padded_npz_count}")
     log_message(f"Fixed length used: {fixed_length_samples} samples ({fixed_length_samples/TARGET_SAMPLING_RATE:.2f} seconds)")
     log_message(f"\nData is ready for PhaseNet at: {base_dir}")
-    log_message(f"Use this command to run PhaseNet prediction:")
+    log_message(f"Use this command to run PhaseNet prediction with original data:")
     log_message(f"python phasenet/predict.py --model=model/190703-214543 --data_list={data_list_csv} --format=numpy")
+    log_message(f"\nUse this command to run PhaseNet prediction with padded data:")
+    log_message(f"python phasenet/predict.py --model=model/190703-214543 --data_list={padded_data_list_csv} --format=numpy")
+    log_message(f"\nUse these files for PhaseNet training with padded data:")
+    log_message(f"Training list: {os.path.join(base_dir, 'padded_train_list.csv')}")
+    log_message(f"Validation list: {os.path.join(base_dir, 'padded_valid_list.csv')}")
 
 if __name__ == "__main__":
     main()
