@@ -1,6 +1,7 @@
 import os
 import pandas as pd
 import time
+import glob
 from obspy import UTCDateTime
 from obspy.clients.fdsn import Client
 from tqdm import tqdm
@@ -21,7 +22,10 @@ end_year = 2025
 output_dir = "./dataset/p_s_pick_metadata_complete"
 os.makedirs(output_dir, exist_ok=True)
 
+# File paths
 log_file = os.path.join(output_dir, "log_progress.txt")
+merged_csv = os.path.join(output_dir, "p_s_pick_metadata_merged.csv")
+filtered_csv = os.path.join(output_dir, "p_s_pick_metadata_filtered.csv")
 
 # Daftar kategori arrival P-wave dan S-wave
 p_phases = {"p", "pp", "pg", "pn", "pb", "pdiff", "pkp", "pkikp"}
@@ -136,9 +140,75 @@ def extract_p_s_picks(event):
 
     return picks
 
+def merge_csv_files():
+    """Menggabungkan semua file CSV di direktori ke dalam satu file CSV"""
+    log_message("Merging all CSV files into a single file...")
+    
+    # Mencari semua file CSV di direktori
+    csv_files = glob.glob(os.path.join(output_dir, "p_s_pick_metadata_*.csv"))
+    
+    # Filter file CSV untuk hanya menyertakan file batch, bukan file merged atau filtered
+    batch_csvs = [f for f in csv_files if 'merged' not in f and 'filtered' not in f]
+    
+    if not batch_csvs:
+        log_message("No CSV files found to merge!")
+        return False
+    
+    log_message(f"Found {len(batch_csvs)} CSV files to merge.")
+    
+    # Menggabungkan semua file CSV
+    dfs = []
+    for csv_file in tqdm(batch_csvs, desc="Reading CSV files", unit="file"):
+        try:
+            df = pd.read_csv(csv_file)
+            dfs.append(df)
+        except Exception as e:
+            log_message(f"Error reading {csv_file}: {e}")
+    
+    if not dfs:
+        log_message("No valid CSV data found for merging!")
+        return False
+    
+    # Menggabungkan semua dataframe
+    merged_df = pd.concat(dfs, ignore_index=True)
+    
+    # Simpan ke file CSV
+    merged_df.to_csv(merged_csv, index=False)
+    log_message(f"Merged CSV file saved at: {merged_csv}")
+    log_message(f"Total records in merged file: {len(merged_df)}")
+    
+    return True
+
+def filter_merged_data():
+    """Filter data merged untuk hanya menyertakan baris dengan P dan S pick"""
+    log_message("Filtering merged data to include only rows with both P and S picks...")
+    
+    try:
+        # Membaca file CSV
+        df = pd.read_csv(merged_csv)
+        log_message(f"🔍 Total data sebelum filtering: {len(df)}")
+        
+        # Filter hanya yang memiliki P dan S pick
+        if 'p_pick_time' in df.columns and 's_pick_time' in df.columns:
+            df_filtered = df.dropna(subset=['p_pick_time', 's_pick_time'])
+            log_message(f"✅ Total data setelah filtering (hanya yang punya P dan S pick): {len(df_filtered)}")
+            
+            # Simpan ke CSV
+            df_filtered.to_csv(filtered_csv, index=False)
+            log_message(f"📂 File hasil filtering disimpan di: {filtered_csv}")
+            return True
+        else:
+            log_message("❌ Kolom 'p_pick_time' atau 's_pick_time' tidak ditemukan di dataset!")
+            return False
+            
+    except Exception as e:
+        log_message(f"Error filtering data: {e}")
+        return False
+
 # ==================== MAIN EXECUTION ====================
 
-if __name__ == "__main__":
+def fetch_and_process_data():
+    """Fetch and process earthquake data"""
     log_message("Starting the P-S pick metadata extraction process...\n")
 
     for year in range(start_year, end_year + 1):
@@ -165,4 +235,15 @@ if __name__ == "__main__":
 
             log_message(f"Finished processing {year} ({batch_start}-{batch_end}). Saved CSV at {csv_output_path}\n")
 
-    log_message("All years processed successfully. Process completed!\n")
+    log_message("All years processed successfully.\n")
+
+if __name__ == "__main__":
+    # Step 1: Fetch and process data
+    fetch_and_process_data()
+    
+    # Step 2: Merge all CSV files
+    if merge_csv_files():
+        # Step 3: Filter merged data
+        filter_merged_data()
+    
+    log_message("Process completed!")
