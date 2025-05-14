@@ -38,7 +38,7 @@ MIN_FIXED_LENGTH = 3000  # Panjang minimum dalam sampel (30 detik pada 100 Hz)
 MAX_FIXED_LENGTH = 60000  # Panjang maksimum dalam sampel (10 menit pada 100 Hz)
 
 # Direktori penyimpanan
-base_dir = "./dataset_phasenet_sample_4 "
+base_dir = "./dataset_phasenet_sample_4"
 metadata_dir = os.path.join(base_dir, "metadata")
 waveform_dir = os.path.join(base_dir, "waveform")
 npz_dir = os.path.join(base_dir, "npz")
