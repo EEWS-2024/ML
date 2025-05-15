@@ -685,7 +685,7 @@ def download_all_waveforms(df, fixed_length_samples):
     success_count = 0
     failure_count = 0
     retry_count = 0
-    max_retries = 3  # For the entire batch
+    max_retries = 5  # For the entire batch
 
     # Create a list to track items that need retry
     retry_list = list(range(len(df)))
