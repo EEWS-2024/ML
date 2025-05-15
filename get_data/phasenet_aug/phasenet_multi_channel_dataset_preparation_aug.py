@@ -1337,6 +1337,122 @@ def create_separate_data_lists():
         log_message(f"Error creating separate data lists: {str(e)}")
         return False
 
+def ensure_uniform_npz_lengths():
+    """Memastikan semua file NPZ padded memiliki panjang yang sama"""
+    log_message("Ensuring all padded NPZ files have uniform length...")
+    
+    # Dapatkan semua file NPZ yang sudah di-padding
+    npz_files = glob.glob(os.path.join(npz_padded_dir, "*.npz"))
+    
+    if not npz_files:
+        log_message("No padded NPZ files found!")
+        return False
+    
+    # Temukan panjang maksimum dari semua file
+    max_length = 0
+    file_lengths = {}
+    
+    # Pertama, scan semua file untuk menemukan panjang maksimum
+    for file_path in tqdm(npz_files, desc="Scanning NPZ lengths"):
+        try:
+            data = np.load(file_path, allow_pickle=True)
+            if 'data' in data:
+                current_length = data['data'].shape[0]
+                file_lengths[file_path] = current_length
+                max_length = max(max_length, current_length)
+        except Exception as e:
+            log_message(f"Error reading {file_path}: {str(e)}")
+    
+    log_message(f"Maximum data length found: {max_length} samples")
+    
+    # Hitung berapa file yang perlu diubah
+    files_to_adjust = [f for f, length in file_lengths.items() if length != max_length]
+    log_message(f"Found {len(files_to_adjust)} files with non-uniform length (out of {len(npz_files)} total files)")
+    
+    if not files_to_adjust:
+        log_message("All files already have uniform length. No adjustment needed.")
+        return True
+    
+    # Sekarang, sesuaikan file yang memiliki panjang berbeda
+    adjusted_count = 0
+    for file_path in tqdm(files_to_adjust, desc="Adjusting NPZ lengths"):
+        try:
+            # Load data
+            npz_data = dict(np.load(file_path, allow_pickle=True))
+            current_length = npz_data['data'].shape[0]
+            
+            # Jika panjangnya kurang dari maksimum, tambahkan padding
+            if current_length < max_length:
+                padding_needed = max_length - current_length
+                
+                # Pad data array
+                original_data = npz_data['data']
+                if len(original_data.shape) == 2:  # (time, channel)
+                    padded_data = np.pad(original_data, ((0, padding_needed), (0, 0)), 'constant')
+                elif len(original_data.shape) == 3:  # (time, 1, channel)
+                    padded_data = np.pad(original_data, ((0, padding_needed), (0, 0), (0, 0)), 'constant')
+                else:
+                    log_message(f"Warning: Unexpected data shape {original_data.shape} in {file_path}")
+                    continue
+                
+                # Update data
+                npz_data['data'] = padded_data
+                
+                # Simpan file yang sudah diupdate
+                np.savez(file_path, **npz_data)
+                adjusted_count += 1
+                
+                log_message(f"Padded {os.path.basename(file_path)}: Added {padding_needed} samples to reach {max_length}")
+                
+            # Jika panjangnya lebih dari maksimum (seharusnya tidak terjadi setelah max_length dihitung)
+            elif current_length > max_length:
+                log_message(f"Warning: File {os.path.basename(file_path)} has length {current_length} > max_length {max_length}")
+                
+                # Potong data agar sesuai max_length
+                original_data = npz_data['data']
+                if len(original_data.shape) >= 2:
+                    npz_data['data'] = original_data[:max_length]
+                    
+                    # Pastikan indeks P dan S masih dalam batas yang valid
+                    if 'p_idx' in npz_data:
+                        for i, group in enumerate(npz_data['p_idx']):
+                            for j, idx in enumerate(group):
+                                if idx >= max_length:
+                                    npz_data['p_idx'][i][j] = max_length - 1
+                                    
+                    if 's_idx' in npz_data:
+                        for i, group in enumerate(npz_data['s_idx']):
+                            for j, idx in enumerate(group):
+                                if idx >= max_length:
+                                    npz_data['s_idx'][i][j] = max_length - 1
+                    
+                    # Simpan file yang sudah diupdate
+                    np.savez(file_path, **npz_data)
+                    adjusted_count += 1
+                    
+                    log_message(f"Trimmed {os.path.basename(file_path)}: Reduced from {current_length} to {max_length} samples")
+                
+        except Exception as e:
+            log_message(f"Error adjusting {file_path}: {str(e)}")
+    
+    # Verifikasi bahwa semua file sekarang memiliki panjang yang sama
+    lengths_after = set()
+    for file_path in tqdm(npz_files, desc="Verifying uniform lengths"):
+        try:
+            data = np.load(file_path, allow_pickle=True)
+            if 'data' in data:
+                lengths_after.add(data['data'].shape[0])
+        except Exception as e:
+            log_message(f"Error verifying {file_path}: {str(e)}")
+    
+    if len(lengths_after) == 1:
+        log_message(f"✅ Verification successful! All {len(npz_files)} files now have uniform length: {list(lengths_after)[0]} samples")
+        return True
+    else:
+        log_message(f"❌ Verification failed! Found {len(lengths_after)} different lengths: {sorted(list(lengths_after))}")
+        return False
+        
+
 # ==================== FUNGSI UTAMA ====================
 
 def main():
@@ -1389,6 +1505,10 @@ def main():
     # Step 7: Post-processing NPZ files untuk padding P index minimal 3001
     log_message("\nSTEP 7: POST-PROCESSING NPZ FILES (PADDING P INDEX)")
     total_processed, total_padded = pad_npz_files()
+    
+    # Step 7.5: Memastikan semua NPZ memiliki panjang yang sama
+    log_message("\nSTEP 7.5: ENSURING UNIFORM LENGTH FOR ALL NPZ FILES")
+    ensure_uniform_npz_lengths()
     
     # Step 8: Buat data list untuk file yang sudah di-padding
     log_message("\nSTEP 8: CREATING DATA LISTS FOR PADDED FILES")
